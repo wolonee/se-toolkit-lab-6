@@ -103,7 +103,7 @@ We refer to your fork as `fork` and to the original repo as `upstream`.
    docker compose --env-file .env.docker.secret up --build -d
    ```
 
-2. Check that the containers are running:
+3. Check that the containers are running:
 
    ```terminal
    docker compose --env-file .env.docker.secret ps --format "table {{.Service}}\t{{.Status}}"
