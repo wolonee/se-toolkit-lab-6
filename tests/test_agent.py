@@ -1,10 +1,11 @@
 """
-Regression tests for agent.py (Task 1 & Task 2)
+Regression tests for agent.py (Task 1, 2, and 3)
 
 Tests verify that the agent:
 - Outputs valid JSON with required fields
 - Executes tool calls correctly
 - Includes source references in answers
+- Uses appropriate tools for different question types
 """
 
 import json
@@ -125,3 +126,85 @@ def test_wiki_listing_question():
     tool_names = [tc.get("tool") for tc in output["tool_calls"]]
     assert "list_files" in tool_names, \
         f"Expected 'list_files' in tool_calls, got: {tool_names}"
+
+
+def test_backend_framework_question():
+    """
+    Test that agent uses read_file for backend source code question (Task 3).
+    
+    Expects:
+    - read_file in tool_calls
+    - FastAPI in answer
+    - backend/ path in source
+    """
+    result = subprocess.run(
+        ["uv", "run", "agent.py", "What Python web framework does the backend use?"],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    # Check exit code
+    assert result.returncode == 0, f"Agent exited with code {result.returncode}, stderr: {result.stderr}"
+
+    # Parse stdout as JSON
+    try:
+        output = json.loads(result.stdout)
+    except json.JSONDecodeError as e:
+        raise AssertionError(f"Agent output is not valid JSON: {e}\nstdout: {result.stdout}")
+
+    # Check required fields exist
+    assert "answer" in output, "Missing 'answer' field in output"
+    assert "source" in output, "Missing 'source' field in output"
+    assert "tool_calls" in output, "Missing 'tool_calls' field in output"
+
+    # Check tool_calls contains read_file
+    tool_names = [tc.get("tool") for tc in output["tool_calls"]]
+    assert "read_file" in tool_names, \
+        f"Expected 'read_file' in tool_calls, got: {tool_names}"
+
+    # Check answer mentions FastAPI
+    answer = output.get("answer", "").lower()
+    assert "fastapi" in answer, \
+        f"Expected 'FastAPI' in answer, got: {output.get('answer', '')}"
+
+
+def test_query_api_tool():
+    """
+    Test that agent uses query_api for database count question (Task 3).
+    
+    Expects:
+    - query_api in tool_calls
+    - A number in the answer
+    """
+    result = subprocess.run(
+        ["uv", "run", "agent.py", "How many items are in the database?"],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    # Check exit code
+    assert result.returncode == 0, f"Agent exited with code {result.returncode}, stderr: {result.stderr}"
+
+    # Parse stdout as JSON
+    try:
+        output = json.loads(result.stdout)
+    except json.JSONDecodeError as e:
+        raise AssertionError(f"Agent output is not valid JSON: {e}\nstdout: {result.stdout}")
+
+    # Check required fields exist
+    assert "answer" in output, "Missing 'answer' field in output"
+    assert "tool_calls" in output, "Missing 'tool_calls' field in output"
+
+    # Check tool_calls contains query_api
+    tool_names = [tc.get("tool") for tc in output["tool_calls"]]
+    assert "query_api" in tool_names, \
+        f"Expected 'query_api' in tool_calls, got: {tool_names}"
+
+    # Check answer contains a number
+    import re
+    answer = output.get("answer", "")
+    numbers = re.findall(r"\d+", answer)
+    assert len(numbers) > 0, \
+        f"Expected a number in answer, got: {answer}"

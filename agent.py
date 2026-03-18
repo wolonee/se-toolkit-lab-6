@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
-Agent CLI - Task 2: The Documentation Agent
+Agent CLI - Task 3: The System Agent
 
 Takes a question as command-line argument, uses an LLM with tool calling
-to discover and read wiki files, and returns a structured JSON answer.
+to discover wiki files, read source code, and query the backend API.
 
 Usage:
-    uv run agent.py "How do you resolve a merge conflict?"
+    uv run agent.py "How many items are in the database?"
 
 Output:
     {
       "answer": "...",
-      "source": "wiki/git-workflow.md#resolving-merge-conflicts",
+      "source": "wiki/git-workflow.md#section",  # optional for system questions
       "tool_calls": [...]
     }
 """
@@ -30,6 +30,7 @@ import httpx
 # =============================================================================
 
 MAX_TOOL_CALLS = 10
+DEFAULT_AGENT_API_BASE_URL = "http://localhost:42002"
 
 
 def load_env_file(env_path: Path) -> dict[str, str]:
@@ -50,16 +51,34 @@ def load_env_file(env_path: Path) -> dict[str, str]:
     return env_vars
 
 
-def load_config() -> tuple[str, str, str]:
-    """Load LLM configuration from environment or .env.agent.secret file."""
+def load_config() -> tuple[str, str, str, str, str]:
+    """
+    Load all configuration from environment or .env files.
+    
+    Returns:
+        (llm_api_base, llm_api_key, llm_model, lms_api_key, agent_api_base_url)
+    """
     project_root = Path(__file__).parent
-    env_path = project_root / ".env.agent.secret"
-    env_vars = load_env_file(env_path)
-
-    api_base = os.environ.get("LLM_API_BASE") or env_vars.get("LLM_API_BASE")
-    api_key = os.environ.get("LLM_API_KEY") or env_vars.get("LLM_API_KEY")
-    model = os.environ.get("LLM_MODEL") or env_vars.get("LLM_MODEL")
-
+    
+    # Load from .env files
+    agent_env_path = project_root / ".env.agent.secret"
+    docker_env_path = project_root / ".env.docker.secret"
+    
+    agent_env_vars = load_env_file(agent_env_path)
+    docker_env_vars = load_env_file(docker_env_path)
+    
+    # LLM configuration (from .env.agent.secret)
+    api_base = os.environ.get("LLM_API_BASE") or agent_env_vars.get("LLM_API_BASE")
+    api_key = os.environ.get("LLM_API_KEY") or agent_env_vars.get("LLM_API_KEY")
+    model = os.environ.get("LLM_MODEL") or agent_env_vars.get("LLM_MODEL")
+    
+    # Backend API configuration (from .env.docker.secret or env)
+    lms_api_key = os.environ.get("LMS_API_KEY") or docker_env_vars.get("LMS_API_KEY")
+    agent_api_base_url = os.environ.get("AGENT_API_BASE_URL") or \
+                         docker_env_vars.get("AGENT_API_BASE_URL") or \
+                         DEFAULT_AGENT_API_BASE_URL
+    
+    # Validate LLM config
     if not api_base:
         print("Error: LLM_API_BASE not set. Configure .env.agent.secret or set LLM_API_BASE env var.", file=sys.stderr)
         sys.exit(1)
@@ -69,8 +88,12 @@ def load_config() -> tuple[str, str, str]:
     if not model:
         print("Error: LLM_MODEL not set. Configure .env.agent.secret or set LLM_MODEL env var.", file=sys.stderr)
         sys.exit(1)
-
-    return api_base, api_key, model
+    
+    # LMS API key is optional - some questions may not need it
+    if not lms_api_key:
+        print("Warning: LMS_API_KEY not set. query_api tool may fail without authentication.", file=sys.stderr)
+    
+    return api_base, api_key, model, lms_api_key, agent_api_base_url
 
 
 # =============================================================================
@@ -84,7 +107,7 @@ def get_tool_schemas() -> list[dict[str, Any]]:
             "type": "function",
             "function": {
                 "name": "list_files",
-                "description": "List files and directories at a given path in the project repository.",
+                "description": "List files and directories at a given path in the project repository. Use this to discover what files exist before reading them.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -101,16 +124,41 @@ def get_tool_schemas() -> list[dict[str, Any]]:
             "type": "function",
             "function": {
                 "name": "read_file",
-                "description": "Read the contents of a file from the project repository.",
+                "description": "Read the contents of a file from the project repository. Use this to read wiki documentation, source code, or configuration files.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "path": {
                             "type": "string",
-                            "description": "Relative file path from project root (e.g., 'wiki/git-workflow.md')."
+                            "description": "Relative file path from project root (e.g., 'wiki/git-workflow.md', 'backend/app/main.py')."
                         }
                     },
                     "required": ["path"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "query_api",
+                "description": "Query the running backend API to get live data or test endpoints. Use this for questions about current database state, HTTP status codes, or API behavior. The backend requires authentication via Bearer token.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "method": {
+                            "type": "string",
+                            "description": "HTTP method (GET, POST, PUT, DELETE, etc.)"
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "API endpoint path (e.g., '/items/', '/analytics/completion-rate')"
+                        },
+                        "body": {
+                            "type": "string",
+                            "description": "Optional JSON request body (for POST/PUT requests)"
+                        }
+                    },
+                    "required": ["method", "path"]
                 }
             }
         }
@@ -210,6 +258,66 @@ def tool_read_file(args: dict[str, Any]) -> str:
         return f"Error reading file: {e}"
 
 
+def tool_query_api(args: dict[str, Any], lms_api_key: str, api_base_url: str) -> str:
+    """
+    Query the backend API.
+    
+    Args:
+        args: {"method": "GET", "path": "/items/", "body": "..."}
+        lms_api_key: API key for authentication
+        api_base_url: Base URL of the backend API
+    
+    Returns:
+        JSON string with status_code and body, or error message.
+    """
+    method = args.get("method", "GET").upper()
+    path = args.get("path", "")
+    body_str = args.get("body")
+    
+    if not path:
+        return "Error: path is required"
+    
+    # Build URL
+    base = api_base_url.rstrip("/")
+    url = f"{base}{path}"
+    
+    # Prepare headers
+    headers = {"Content-Type": "application/json"}
+    if lms_api_key:
+        headers["Authorization"] = f"Bearer {lms_api_key}"
+    
+    # Prepare body
+    json_body = None
+    if body_str:
+        try:
+            json_body = json.loads(body_str)
+        except json.JSONDecodeError:
+            return f"Error: Invalid JSON in body: {body_str[:100]}"
+    
+    try:
+        with httpx.Client(timeout=30.0) as client:
+            response = client.request(method, url, headers=headers, json=json_body)
+            
+            # Try to parse response as JSON
+            try:
+                response_body = response.json()
+            except (json.JSONDecodeError, Exception):
+                response_body = response.text
+            
+            result = {
+                "status_code": response.status_code,
+                "body": response_body,
+            }
+            return json.dumps(result)
+            
+    except httpx.HTTPStatusError as e:
+        return json.dumps({"status_code": e.response.status_code, "error": str(e)})
+    except httpx.RequestError as e:
+        return f"Error: Network error - {e}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
 TOOL_FUNCTIONS = {
     "list_files": tool_list_files,
     "read_file": tool_read_file,
@@ -258,6 +366,8 @@ def run_agent_loop(
     api_base: str,
     api_key: str,
     model: str,
+    lms_api_key: str,
+    agent_api_base_url: str,
 ) -> dict[str, Any]:
     """
     Run the agentic loop: call LLM, execute tools, feed results back.
@@ -268,29 +378,36 @@ def run_agent_loop(
     project_root = get_project_root()
     
     # Build system prompt
-    system_prompt = f"""You are a documentation agent for a software engineering project.
-Your goal is to answer questions by reading documentation in the wiki directory.
+    system_prompt = f"""You are a documentation and system agent for a software engineering project.
+Your goal is to answer questions by reading documentation, source code, and querying the live API.
 
-You have two tools:
+You have three tools:
 1. list_files(path: str) - List files in a directory
 2. read_file(path: str) - Read a file's contents
+3. query_api(method: str, path: str, body: str?) - Query the backend API
 
-Strategy:
-1. Use list_files("wiki") to discover what documentation exists.
-2. Use read_file to read relevant wiki files.
-3. When you find the answer, respond with a JSON object:
-   {{
-     "answer": "your answer here",
-     "source": "wiki/filename.md#section-anchor"
-   }}
+Tool selection strategy:
+- For wiki/documentation questions → use list_files("wiki") then read_file
+- For source code questions → use read_file on backend/ files directly
+- For live data questions (counts, status codes, API behavior) → use query_api
+- For bug diagnosis → use query_api to reproduce the error, then read_file to find the bug
+
+When you find the answer, respond with a JSON object:
+{{
+  "answer": "your answer here",
+  "source": "wiki/filename.md#section-anchor or backend/path.py"
+}}
 
 Rules:
-- Always include a source reference in the format wiki/filename.md#section-anchor
-- If the section is unclear, use just the file path: wiki/filename.md
-- Keep answers concise and accurate.
-- Do not make up information - only use what you read from files.
+- Always include a source reference when reading files (format: path/to/file.md#section or path/to/file.py)
+- For API queries, you can use the API endpoint as source (e.g., "API: GET /items/")
+- If the section is unclear, use just the file path
+- Keep answers concise and accurate
+- Do not make up information - only use what you read from files or API responses
+- For query_api, always include the Authorization header with the LMS API key
 
 Project root: {project_root}
+Backend API base URL: {agent_api_base_url}
 """
     
     messages: list[dict[str, Any]] = [
@@ -318,7 +435,7 @@ Project root: {project_root}
                 "tool_calls": tool_calls_output,
             }
         
-        content = assistant_message.get("content", "")
+        content = assistant_message.get("content") or ""
         tool_calls = assistant_message.get("tool_calls", [])
         
         # If no tool calls, we have a final answer
@@ -355,6 +472,11 @@ Project root: {project_root}
             if tool_name in TOOL_FUNCTIONS:
                 try:
                     result = TOOL_FUNCTIONS[tool_name](tool_args)
+                except Exception as e:
+                    result = f"Error executing tool: {e}"
+            elif tool_name == "query_api":
+                try:
+                    result = tool_query_api(tool_args, lms_api_key, agent_api_base_url)
                 except Exception as e:
                     result = f"Error executing tool: {e}"
             else:
@@ -412,17 +534,17 @@ def main() -> None:
     # Parse command-line arguments
     if len(sys.argv) < 2:
         print("Usage: uv run agent.py \"<question>\"", file=sys.stderr)
-        print("Example: uv run agent.py \"How do you resolve a merge conflict?\"", file=sys.stderr)
+        print("Example: uv run agent.py \"How many items are in the database?\"", file=sys.stderr)
         sys.exit(1)
     
     question = sys.argv[1]
     
     # Load configuration
-    api_base, api_key, model = load_config()
+    api_base, api_key, model, lms_api_key, agent_api_base_url = load_config()
     
     try:
         # Run the agentic loop
-        result = run_agent_loop(question, api_base, api_key, model)
+        result = run_agent_loop(question, api_base, api_key, model, lms_api_key, agent_api_base_url)
         output_result(
             answer=result["answer"],
             source=result["source"],
