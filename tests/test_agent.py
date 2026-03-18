@@ -1,10 +1,10 @@
 """
-Regression tests for agent.py (Task 1)
+Regression tests for agent.py (Task 1 & Task 2)
 
 Tests verify that the agent:
-- Outputs valid JSON
-- Has required 'answer' and 'tool_calls' fields
-- Exits with code 0 on success
+- Outputs valid JSON with required fields
+- Executes tool calls correctly
+- Includes source references in answers
 """
 
 import json
@@ -13,7 +13,7 @@ import sys
 
 
 def test_agent_outputs_valid_json():
-    """Test that agent.py outputs valid JSON with required fields."""
+    """Test that agent.py outputs valid JSON with required fields (Task 1)."""
     result = subprocess.run(
         ["uv", "run", "agent.py", "What is 2 + 2?"],
         capture_output=True,
@@ -51,3 +51,77 @@ def test_agent_missing_question():
     # Should print usage to stderr
     assert "Usage" in result.stderr or "question" in result.stderr.lower(), \
         f"Agent should print usage to stderr, got: {result.stderr}"
+
+
+def test_merge_conflict_question():
+    """
+    Test that agent uses read_file tool for merge conflict question (Task 2).
+    
+    Expects:
+    - read_file in tool_calls
+    - wiki/git-workflow.md in source
+    """
+    result = subprocess.run(
+        ["uv", "run", "agent.py", "How do you resolve a merge conflict?"],
+        capture_output=True,
+        text=True,
+        timeout=120,  # Allow up to 2 minutes for LLM response
+    )
+
+    # Check exit code
+    assert result.returncode == 0, f"Agent exited with code {result.returncode}, stderr: {result.stderr}"
+
+    # Parse stdout as JSON
+    try:
+        output = json.loads(result.stdout)
+    except json.JSONDecodeError as e:
+        raise AssertionError(f"Agent output is not valid JSON: {e}\nstdout: {result.stdout}")
+
+    # Check required fields exist
+    assert "answer" in output, "Missing 'answer' field in output"
+    assert "source" in output, "Missing 'source' field in output"
+    assert "tool_calls" in output, "Missing 'tool_calls' field in output"
+
+    # Check tool_calls contains read_file
+    tool_names = [tc.get("tool") for tc in output["tool_calls"]]
+    assert "read_file" in tool_names, \
+        f"Expected 'read_file' in tool_calls, got: {tool_names}"
+
+    # Check source contains wiki/git-workflow.md
+    source = output.get("source", "")
+    assert "wiki/git-workflow.md" in source, \
+        f"Expected 'wiki/git-workflow.md' in source, got: {source}"
+
+
+def test_wiki_listing_question():
+    """
+    Test that agent uses list_files tool for wiki listing question (Task 2).
+    
+    Expects:
+    - list_files in tool_calls
+    """
+    result = subprocess.run(
+        ["uv", "run", "agent.py", "What files are in the wiki?"],
+        capture_output=True,
+        text=True,
+        timeout=120,  # Allow up to 2 minutes for LLM response
+    )
+
+    # Check exit code
+    assert result.returncode == 0, f"Agent exited with code {result.returncode}, stderr: {result.stderr}"
+
+    # Parse stdout as JSON
+    try:
+        output = json.loads(result.stdout)
+    except json.JSONDecodeError as e:
+        raise AssertionError(f"Agent output is not valid JSON: {e}\nstdout: {result.stdout}")
+
+    # Check required fields exist
+    assert "answer" in output, "Missing 'answer' field in output"
+    assert "source" in output, "Missing 'source' field in output"
+    assert "tool_calls" in output, "Missing 'tool_calls' field in output"
+
+    # Check tool_calls contains list_files
+    tool_names = [tc.get("tool") for tc in output["tool_calls"]]
+    assert "list_files" in tool_names, \
+        f"Expected 'list_files' in tool_calls, got: {tool_names}"
